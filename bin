@@ -1,0 +1,124 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'bundler'
+require 'bundler/setup'
+
+require 'yaml'
+require 'optparse'
+
+class Divm
+  def initialize(args = [])
+    @options = {}
+    args << '-h' if args.length.zero?
+
+    OptionParser.new do |opt|
+      opt.on('-h', '--help', 'Show help') do
+        puts opt
+        exit 1
+      end
+
+      opt.on('-s', '--start', 'Start version') { check_version }
+      opt.on('-b', '--build', 'build image') { build_image }
+      opt.on('-p', '--push', 'push image') { push_image }
+      opt.on('-e', '--environment=ENVIRONMENT', 'Environment') { |v| @options[:environment] = v }
+    end.parse!
+  end
+
+  private
+
+  def current_path
+    @current_path ||= Dir.pwd
+  end
+
+  def divm_path
+    "#{current_path}/.DIVM"
+  end
+
+  def check_version
+    if File.file?(divm_path)
+      puts "Current version: #{current_version}\nCurrent url: #{current_url}"
+      puts "\tOverride to 0.0.1? (y/n)"
+      option = gets.chomp
+      set_initial_divm if %w[y yes].include? option.downcase
+    else
+      set_initial_divm
+    end
+  end
+
+  def set_initial_divm
+    puts 'Start with 0.0.1? (y/w)'
+    option = gets.chomp
+
+    version =
+      if %w[y yes].include? option.downcase
+        '0.0.1'
+      else
+        gets.chomp
+      end
+
+    puts 'Insert url repository'
+    url = gets.chomp
+    yaml = {
+      'version' => version,
+      'url' => url
+    }.to_yaml
+
+    File.open(divm_path, 'w') { |f| f.write(yaml) }
+  end
+
+  def current_data
+    @current_data ||= YAML.load_file(divm_path)
+  end
+
+  def current_url
+    current_data['url']
+  end
+
+  def current_version
+    current_data['version']
+  end
+
+  def build_image
+    log_file = "#{current_path}/log/build_image.log"
+    version = current_version
+
+    system "echo '@@@@@ STARTED BUILD IMAGE (version: #{version}) @@@@@\n\n' | tee -a #{log_file}"
+    if @options[:environment] == 'staging'
+      system "docker build -t #{current_url}:staging . >> #{log_file}"
+    else
+      split = version.split('.')
+      split[-1] = split[-1].to_i + 1
+      version = split.join('.')
+
+      system "docker build -t #{current_url}:latest -t #{current_url}:#{version} . | tee -a #{log_file}"
+    end
+    system "echo '@@@@@ FINISHED BUILD IMAGE (version: #{version}) @@@@@\n\n' | tee -a #{log_file}"
+
+    # update version
+    unless @options[:environment] == 'staging'
+      yaml = current_data.merge('version' => version).to_yaml
+      File.open(divm_path, 'w') { |f| f.write(yaml) }
+    end
+
+    puts 'Image built'
+  end
+
+  def push_image
+    log_file = "#{current_path}/log/push_image.log"
+
+    if @options[:environment] == 'staging'
+      system "echo '@@@@@ STARTED PUSH IMAGE (staging) TO ECR @@@@@\n\n' | tee -a #{log_file}"
+      system "docker push #{current_url}:staging | tee -a #{log_file}"
+    else
+      system "echo '@@@@@ STARTED PUSH IMAGE (latest) TO ECR @@@@@\n\n' | tee -a #{log_file}"
+      system "docker push #{current_url}:latest | tee -a #{log_file}"
+      system "echo '@@@@@ STARTED PUSH IMAGE (version:#{current_version}) TO ECR @@@@@\n\n' | tee -a #{log_file}"
+      system "docker push #{current_url}:#{current_version} | tee -a #{log_file}"
+    end
+
+    system "echo '@@@@@ FINISHED PUSH IMAGE TO ECR @@@@@\n\n' | tee -a #{log_file}"
+  end
+end
+
+Divm.new(ARGV)
