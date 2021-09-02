@@ -6,26 +6,81 @@ require 'bundler/setup'
 
 require 'yaml'
 require 'optparse'
+require 'fileutils'
 
 class Divm
   def initialize(args = [])
     @options = {}
     args << '-h' if args.length.zero?
 
-    OptionParser.new do |opt|
-      opt.on('-h', '--help', 'Show help') do
+    args = OptionParser.new do |opt|
+      opt.banner = usage
+
+      opt.on('-h', '--help', 'Help') do
         puts opt
         exit 1
       end
 
-      opt.on('-s', '--start', 'Start version') { check_version }
-      opt.on('-b', '--build', 'build image') { build_image }
-      opt.on('-p', '--push', 'push image') { push_image }
-      opt.on('-e', '--environment=ENVIRONMENT', 'Environment') { |v| @options[:environment] = v }
+      opt.on('-v', '--version', 'Show divm version') do
+        puts '0.0.1'
+        exit 1
+      end
+
+      opt.on('-ni', '--not-increment', 'not increment tag version') { @options['ni'] = true }
+      opt.on('-t', '--tag=tag', 'Tag') { |v| @options['tag'] = v }
+      opt.on('--tags=tag,tag1,tag2,...', 'Tags') { |v| @options['tags'] = v.split(',') }
     end.parse!
+
+    @options['command'] = args.first
+  end
+
+  def perform
+    case @options['command']
+    when 'show-settings'
+      check_valid_file_setting!
+      puts current_data
+    when 'start'
+      init_divm
+    when 'build', 'push'
+      build_or_push_image
+    else
+      putss 'Invalid option'
+      exit false
+    end
   end
 
   private
+
+  def usage
+    [
+      'Usage: divm [options] start|build|push',
+      "#{space}start: start configuration",
+      "#{space}build: build image",
+      "#{space}push: push image",
+      "#{space}show-settings: Show settings",
+      ' ',
+      'Options:'
+    ].join("\n")
+  end
+
+  def space
+    '    '
+  end
+
+  def putss(value)
+    puts "#{space}#{value}"
+  end
+
+  def print_yn
+    print "#{space}(y/n): "
+  end
+
+  def check_valid_file_setting!
+    return true if valid_file_settings?
+
+    putss 'Uninitialized or invalid settings!'
+    exit false
+  end
 
   def current_path
     @current_path ||= Dir.pwd
@@ -35,36 +90,65 @@ class Divm
     "#{current_path}/.DIVM"
   end
 
-  def check_version
-    if File.file?(divm_path)
-      puts "Current version: #{current_version}\nCurrent url: #{current_url}"
-      puts "\tOverride to 0.0.1? (y/n)"
-      option = gets.chomp
+  def init_divm
+    if valid_file_settings?
+      putss "Current version: #{current_version}"
+      putss "Current url: #{current_url}"
+      putss "Current file_log: #{current_file_log}" if current_file_log
+      putss 'Override settings?'
+      print_yn
+      option = $stdin.gets.chomp
       set_initial_divm if %w[y yes].include? option.downcase
     else
       set_initial_divm
     end
   end
 
+  def valid_file_settings?
+    File.file?(divm_path) && current_version && current_url
+  rescue StandardError
+    nil
+  end
+
   def set_initial_divm
-    puts 'Start with 0.0.1? (y/w)'
-    option = gets.chomp
+    putss 'Start with 0.0.1?'
+    print_yn
+    option = $stdin.gets.chomp
 
     version =
       if %w[y yes].include? option.downcase
         '0.0.1'
       else
-        gets.chomp
+        $stdin.gets.chomp
       end
 
-    puts 'Insert url repository'
-    url = gets.chomp
-    yaml = {
+    putss 'Insert url repository'
+    print "#{space}url: "
+    url = $stdin.gets.chomp
+
+    putss 'Filelog?'
+    print_yn
+    option = $stdin.gets.chomp
+
+    file_log = nil
+    file_log = create_file_log if %w[y yes].include? option.downcase
+
+    options = {
       'version' => version,
       'url' => url
-    }.to_yaml
+    }
+    options['file_log'] = file_log if file_log
 
-    File.open(divm_path, 'w') { |f| f.write(yaml) }
+    File.open(divm_path, 'w') { |f| f.write(options.to_yaml) }
+  end
+
+  def create_file_log
+    print "#{space}Insert file log name: "
+    file_log = $stdin.gets.chomp
+    dir = File.dirname(file_log)
+    FileUtils.mkdir_p dir unless File.directory? dir
+    File.new(file_log, 'w')
+    file_log
   end
 
   def current_data
@@ -79,46 +163,76 @@ class Divm
     current_data['version']
   end
 
-  def build_image
-    log_file = "#{current_path}/log/build_image.log"
-    version = current_version
-
-    system "echo '@@@@@ STARTED BUILD IMAGE (version: #{version}) @@@@@\n\n' | tee -a #{log_file}"
-    if @options[:environment] == 'staging'
-      system "docker build -t #{current_url}:staging . >> #{log_file}"
-    else
-      split = version.split('.')
-      split[-1] = split[-1].to_i + 1
-      version = split.join('.')
-
-      system "docker build -t #{current_url}:latest -t #{current_url}:#{version} . | tee -a #{log_file}"
-    end
-    system "echo '@@@@@ FINISHED BUILD IMAGE (version: #{version}) @@@@@\n\n' | tee -a #{log_file}"
-
-    # update version
-    unless @options[:environment] == 'staging'
-      yaml = current_data.merge('version' => version).to_yaml
-      File.open(divm_path, 'w') { |f| f.write(yaml) }
-    end
-
-    puts 'Image built'
+  def current_file_log
+    current_data['file_log']
   end
 
-  def push_image
-    log_file = "#{current_path}/log/push_image.log"
+  def next_tag
+    split = current_version.split('.')
+    split[-1] = split[-1].to_i + 1
+    split.join('.')
+  end
 
-    if @options[:environment] == 'staging'
-      system "echo '@@@@@ STARTED PUSH IMAGE (staging) TO ECR @@@@@\n\n' | tee -a #{log_file}"
-      system "docker push #{current_url}:staging | tee -a #{log_file}"
+  def build_or_push_image
+    command = @options['command']
+
+    if @options['tag']
+      send "#{command}_image_with_tag",  @options['tag']
+    elsif @options['tags']
+      send "#{command}_image_with_tag", *@options['tags']
     else
-      system "echo '@@@@@ STARTED PUSH IMAGE (latest) TO ECR @@@@@\n\n' | tee -a #{log_file}"
-      system "docker push #{current_url}:latest | tee -a #{log_file}"
-      system "echo '@@@@@ STARTED PUSH IMAGE (version:#{current_version}) TO ECR @@@@@\n\n' | tee -a #{log_file}"
-      system "docker push #{current_url}:#{current_version} | tee -a #{log_file}"
+      send "#{command}_versioned_image"
     end
+  end
 
-    system "echo '@@@@@ FINISHED PUSH IMAGE TO ECR @@@@@\n\n' | tee -a #{log_file}"
+  def check_dockerfile!
+    return if File.file?('Dockerfile')
+
+    putss 'Not found Dockerfile'
+    exit false
+  end
+
+  def build_versioned_image
+    check_dockerfile!
+
+    tag_version = next_tag
+    system "echo '@@@@@ STARTED BUILD IMAGE (tag \"#{tag_version}\" and tag \"latest\") @@@@@\n' #{append_log}"
+    system "docker build -t #{current_url}:latest -t #{current_url}:#{tag_version} . #{append_log}"
+    yaml = current_data.merge('version' => next_tag).to_yaml
+    File.open(divm_path, 'w') { |f| f.write(yaml) }
+    putss 'Image built'
+  end
+
+  def build_image_with_tag(tag, *tags)
+    check_dockerfile!
+
+    tags.unshift(tag)
+    system "echo '@@@@@ STARTED BUILD IMAGE (tags: [#{tags.join(', ')}]) @@@@@\n' #{append_log}"
+    commands = tags.map { |tag| "-t #{current_url}:#{tag} " }.reduce(&:+)
+    system "docker build #{commands} . #{append_log}"
+    putss 'Image built'
+  end
+
+  def push_versioned_image
+    system "echo '@@@@@ STARTED PUSH IMAGE (latest) @@@@@\n\n' #{append_log}"
+    system "docker push #{current_url}:latest #{append_log}"
+    system "echo '@@@@@ STARTED PUSH IMAGE (version:#{current_version}) @@@@@\n\n' #{append_log}"
+    system "docker push #{current_url}:#{current_version} #{append_log}"
+    system "echo '@@@@@ FINISHED PUSH IMAGE @@@@@\n\n' #{append_log}"
+  end
+
+  def push_image_with_tag(tag, *tags)
+    tags.unshift(tag)
+    tags.each do |tag|
+      system "echo '@@@@@ STARTED PUSH IMAGE (tag: #{tag}) @@@@@\n\n' #{append_log}"
+      system "docker push #{current_url}:#{tag} #{append_log}"
+      system "echo '@@@@@ FINISHED PUSH IMAGE @@@@@\n\n' #{append_log}"
+    end
+  end
+
+  def append_log
+    current_file_log ? "| tee -a #{current_file_log}" : ''
   end
 end
 
-Divm.new(ARGV)
+Divm.new(ARGV).perform
